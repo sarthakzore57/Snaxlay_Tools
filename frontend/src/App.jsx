@@ -1,7 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+function resolveApiBase() {
+  const configuredBase = (import.meta.env.VITE_API_BASE_URL || "").trim();
+  if (configuredBase) {
+    return configuredBase.replace(/\/$/, "");
+  }
+  if (typeof window !== "undefined") {
+    const { protocol, hostname } = window.location;
+    if (protocol.startsWith("http") && ["localhost", "127.0.0.1"].includes(hostname)) {
+      return "http://127.0.0.1:8000";
+    }
+  }
+  return "";
+}
+
+const API_BASE = resolveApiBase();
 const emptyOrdersState = {
   selected_day: "today",
   available_days: [],
@@ -34,6 +48,40 @@ const workspaceOptions = [
   { value: "print", title: "Print Studio" },
   { value: "orders", title: "Orders Dashboard" },
 ];
+
+function getErrorMessage(requestError, fallbackMessage) {
+  const detail = requestError.response?.data?.detail;
+  if (typeof detail === "string" && detail.trim()) {
+    return detail;
+  }
+  if (Array.isArray(detail) && detail.length) {
+    const messages = detail
+      .map((item) => {
+        if (typeof item === "string") {
+          return item;
+        }
+        if (item && typeof item === "object" && typeof item.msg === "string") {
+          return item.msg;
+        }
+        return "";
+      })
+      .filter(Boolean);
+    if (messages.length) {
+      return messages.join(" ");
+    }
+  }
+  if (detail && typeof detail === "object" && typeof detail.message === "string") {
+    return detail.message;
+  }
+  if (requestError.response?.status) {
+    const { status, statusText } = requestError.response;
+    return `Request failed (${status}${statusText ? ` ${statusText}` : ""}).`;
+  }
+  if (typeof requestError.message === "string" && requestError.message.trim()) {
+    return requestError.message;
+  }
+  return fallbackMessage;
+}
 
 function estimateProcessingTime(file, detectionMode, layout) {
   if (!file || (Array.isArray(file) && file.length === 0)) {
@@ -136,7 +184,10 @@ function App() {
       });
       setOrdersData(response.data);
     } catch (requestError) {
-      setOrdersError(requestError.response?.data?.detail || "Unable to load the orders dashboard.");
+      const fallbackMessage = requestError.code === "ERR_NETWORK"
+        ? "Unable to reach the backend API. Check VITE_API_BASE_URL or your deployment routing."
+        : "Unable to load the orders dashboard.";
+      setOrdersError(getErrorMessage(requestError, fallbackMessage));
     } finally {
       setOrdersLoading(false);
     }
@@ -193,7 +244,10 @@ function App() {
         resetPolling();
       }
     } catch (requestError) {
-      setError(requestError.response?.data?.detail || "Unable to fetch job progress.");
+      const fallbackMessage = requestError.code === "ERR_NETWORK"
+        ? "Unable to reach the backend API while checking progress."
+        : "Unable to fetch job progress.";
+      setError(getErrorMessage(requestError, fallbackMessage));
       setIsSubmitting(false);
       resetPolling();
     }
@@ -223,7 +277,6 @@ function App() {
 
     try {
       const response = await axios.post(`${API_BASE}/api/process`, formData, {
-        headers: { "Content-Type": "multipart/form-data" },
         onUploadProgress: (progressEvent) => {
           if (!progressEvent.total) {
             return;
@@ -255,8 +308,10 @@ function App() {
         pollJob(submittedJob.job_id);
       }, 1200);
     } catch (requestError) {
-      const detail = requestError.response?.data?.detail;
-      setError(detail || "Unable to submit the PDF for processing.");
+      const fallbackMessage = requestError.code === "ERR_NETWORK"
+        ? "Unable to reach the backend API. Set VITE_API_BASE_URL to your backend or proxy /api to the backend."
+        : "Unable to submit the PDF for processing.";
+      setError(getErrorMessage(requestError, fallbackMessage));
       setIsSubmitting(false);
     }
   };
