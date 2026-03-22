@@ -16,6 +16,9 @@ function resolveApiBase() {
 }
 
 const API_BASE = resolveApiBase();
+const isBrowser = typeof window !== "undefined";
+const isLocalHost = isBrowser && ["localhost", "127.0.0.1"].includes(window.location.hostname);
+const missingHostedApiConfig = isBrowser && !isLocalHost && !API_BASE;
 const emptyOrdersState = {
   selected_day: "today",
   available_days: [],
@@ -50,6 +53,9 @@ const workspaceOptions = [
 ];
 
 function getErrorMessage(requestError, fallbackMessage) {
+  if (requestError.response?.status === 404 && missingHostedApiConfig) {
+    return "Frontend is deployed, but the backend API is not available at /api. Deploy the FastAPI backend separately and set VITE_API_BASE_URL to that backend URL.";
+  }
   const detail = requestError.response?.data?.detail;
   if (typeof detail === "string" && detail.trim()) {
     return detail;
@@ -382,6 +388,16 @@ function App() {
             <h2>Upload Labels</h2>
             <span className="status-pill">{isSubmitting ? "Processing" : "Ready"}</span>
           </div>
+
+          {missingHostedApiConfig ? (
+            <div className="error-banner">
+              This site is running without a backend API. Netlify is only serving the frontend right now. Deploy the FastAPI backend and set
+              {" "}
+              <code>VITE_API_BASE_URL</code>
+              {" "}
+              to that backend URL.
+            </div>
+          ) : null}
 
           <div
             className={`dropzone ${dragging ? "dragging" : ""}`}

@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -10,9 +12,17 @@ from app.services.job_manager import JobManager
 app = FastAPI(title="Shipping Label Arranger", version="1.0.0")
 job_manager = JobManager()
 
+cors_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+extra_cors_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()]
+cors_origins.extend(extra_cors_origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=cors_origins,
+    allow_origin_regex=r"https://([a-zA-Z0-9-]+\.)?(vercel\.app|netlify\.app|onrender\.com)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,11 +45,13 @@ def healthcheck() -> dict[str, str]:
 
 @app.post("/api/process", response_model=JobSubmitResponse)
 async def process_pdf(
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] | None = File(None),
+    file_items: list[UploadFile] | None = File(None, alias="file"),
     layout: int = Form(2),
     detection_mode: str = Form("basic"),
     paper_size: str = Form("A4"),
 ) -> JobSubmitResponse:
+    files = [*(files or []), *(file_items or [])]
     if not files:
         raise HTTPException(status_code=400, detail="At least one PDF file is required.")
     if layout not in {2, 4, 6}:
