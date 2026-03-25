@@ -182,10 +182,7 @@ class PDFProcessor:
                 text_label_boxes=text_label_boxes,
             )
 
-        if text_label_boxes:
-            normalized_labels = [self._normalize_label(label) for label in labels]
-        else:
-            normalized_labels = [self._normalize_label(self._remove_invoice_panel(label, layout)) for label in labels]
+        normalized_labels = [self._normalize_label(self._remove_invoice_panel(label, layout)) for label in labels]
         return {
             "labels": normalized_labels,
             "warnings": warnings,
@@ -193,14 +190,29 @@ class PDFProcessor:
 
     def _remove_invoice_panel(self, label: Image.Image, layout: int) -> Image.Image:
         width, height = label.size
-        keep_width = int(width * (0.58 if layout == 2 else 0.56))
-        cropped = label.crop((0, 0, keep_width, height))
+        if width < height * 1.1:
+            return label
 
-        grayscale = ImageOps.grayscale(cropped)
-        bbox = ImageOps.invert(grayscale).getbbox()
-        if bbox:
-            cropped = cropped.crop(bbox)
-        return cropped
+        rgb = np.array(label.convert("RGB"))
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        thresh = cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            8,
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        merged = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        content_box = self._find_invoice_free_area(merged, width, height, layout)
+        if content_box is None:
+            return label
+
+        left, top, crop_width, crop_height = content_box
+        return label.crop((left, top, left + crop_width, top + crop_height))
 
     def _estimate_processing_seconds(self, source_page_count: int, pdf_size_bytes: int, detection_mode: str) -> float:
         size_mb = pdf_size_bytes / (1024 * 1024)
@@ -269,12 +281,12 @@ class PDFProcessor:
         order_date = self._normalize_date(self._first_capture(text, r"ORDER DATE\s*:\s*([^\n]+)"))
         invoice_date = self._normalize_date(self._first_capture(text, r"INVOICE DATE\s*:\s*([^\n]+)"))
         price = self._to_float(self._first_capture(text, r"TOTAL\(\s*INCLUSIVE OF TAXES\)\s*Rs\.?\s*([0-9]+(?:\.[0-9]+)?)"))
-        quantity = self._to_int(self._first_capture(text, r"QUANTITY\s*([0-9]+)"))
         order_day = order_date or invoice_date or datetime.now().date().isoformat()
         order_id = self._first_capture(text, r"ORDER NO\.\s*:\s*([A-Z0-9]+)")
         suborder_id = self._first_capture(text, r"SUBORDER NO\.\s*:\s*([A-Z0-9]+)") or self._first_capture(
             text, r"SUBORDER CODE\s*([0-9A-Z]+)"
         )
+        quantity = self._extract_snapdeal_quantity(text, suborder_id)
         sku_code = self._first_capture(text, r"SKU CODE:\s*([A-Z0-9\-]+)") or self._extract_sku_from_suborder_line(text)
         delivery_option = self._first_capture(text, r"\b(COD|PREPAID)\b")
         awb_number = self._first_capture(text, r"Snapdeal Reference No\s*([A-Z0-9]+)")
@@ -421,16 +433,54 @@ class PDFProcessor:
         }
 
     def _extract_snapdeal_product_name(self, text: str) -> str | None:
+        product_block = re.search(r"PRODUCT NAME\s*QUANTITY\s*(.*?)\s*AMOUNT ALREADY PAID", text, re.I | re.S)
+        if product_block:
+            lines = [line.strip() for line in product_block.group(1).splitlines() if line.strip()]
+            if lines:
+                first_line = lines[0]
+                if not re.fullmatch(r"[A-Z0-9\-]+", first_line, re.I) and first_line.upper() != "QUANTITY":
+                    return first_line
+
         match = re.search(r"ITEM DESCRIPTION\s*(.*?)\s*SKU CODE:", text, re.I | re.S)
         if not match:
             return None
         lines = [line.strip() for line in match.group(1).splitlines() if line.strip()]
         for line in lines:
             upper_line = line.upper()
-            if "ITEM DESCRIPTION" in upper_line or "SKU CODE:" in upper_line:
+            if "ITEM DESCRIPTION" in upper_line or "SKU CODE:" in upper_line or upper_line in {"QTY", "RATE", "TOTAL", "DISC"}:
                 continue
             return line.title() if line.isupper() else line
         return None
+
+    def _extract_snapdeal_quantity(self, text: str, suborder_id: str | None) -> int | None:
+        product_block = re.search(r"PRODUCT NAME\s*QUANTITY\s*(.*?)\s*AMOUNT ALREADY PAID", text, re.I | re.S)
+        if product_block:
+            lines = [line.strip() for line in product_block.group(1).splitlines() if line.strip()]
+            for line in reversed(lines):
+                quantity = self._safe_quantity(line, suborder_id)
+                if quantity is not None:
+                    return quantity
+
+        invoice_block = re.search(r"HSN:[^\n]*\n([^\n]+)", text, re.I)
+        if invoice_block:
+            quantity = self._safe_quantity(invoice_block.group(1), suborder_id)
+            if quantity is not None:
+                return quantity
+
+        quantity = self._safe_quantity(self._first_capture(text, r"QUANTITY\s*([0-9]+)"), suborder_id)
+        if quantity is not None:
+            return quantity
+        return 1
+
+    def _safe_quantity(self, value: str | None, suborder_id: str | None) -> int | None:
+        quantity = self._to_int(value)
+        if quantity is None:
+            return None
+        if suborder_id and str(quantity) == str(suborder_id):
+            return None
+        if quantity <= 0 or quantity > 50:
+            return None
+        return quantity
 
     def _extract_flipkart_product_data(self, text: str) -> tuple[str | None, str | None]:
         match = re.search(r"SKU ID\s*\|\s*Description\s*QTY\s*(.*?)\s*(?:FMP[A-Z0-9]+|Tax Invoice|AWB No\.)", text, re.I | re.S)
@@ -998,12 +1048,81 @@ class PDFProcessor:
         return intersection / union if union else 0.0
 
     def _normalize_label(self, label: Image.Image) -> Image.Image:
-        label = self._extract_primary_label_area(label)
         grayscale = ImageOps.grayscale(label)
-        bbox = ImageOps.invert(grayscale).getbbox()
+        bbox = ImageOps.invert(grayscale.point(lambda value: 255 if value < 245 else 0)).getbbox()
         if bbox:
             label = label.crop(bbox)
         return ImageOps.expand(label.convert("RGB"), border=8, fill="white")
+
+    def _find_invoice_free_area(
+        self,
+        merged: np.ndarray,
+        width: int,
+        height: int,
+        layout: int,
+    ) -> tuple[int, int, int, int] | None:
+        column_density = np.count_nonzero(merged, axis=0) / max(height, 1)
+        active_columns = column_density > 0.03
+
+        spans: list[tuple[int, int]] = []
+        start: int | None = None
+        min_span_width = max(24, int(width * 0.08))
+        for index, is_active in enumerate(active_columns):
+            if is_active and start is None:
+                start = index
+            elif not is_active and start is not None:
+                if index - start >= min_span_width:
+                    spans.append((start, index))
+                start = None
+        if start is not None and width - start >= min_span_width:
+            spans.append((start, width))
+
+        if len(spans) < 2:
+            return None
+
+        left_span = next((span for span in spans if span[0] <= width * 0.12), None)
+        if left_span is None:
+            return None
+
+        right_candidates = [span for span in spans if span[0] > left_span[1]]
+        if not right_candidates:
+            return None
+
+        right_span = max(right_candidates, key=lambda span: span[1] - span[0])
+        left_width = left_span[1] - left_span[0]
+        right_width = right_span[1] - right_span[0]
+        gap_width = right_span[0] - left_span[1]
+        max_right_width_ratio = 0.72
+        if left_width < width * 0.2:
+            return None
+        if left_width >= right_width:
+            return None
+        if right_width > width * max_right_width_ratio:
+            return None
+        if gap_width < width * 0.025:
+            return None
+
+        left_roi = merged[:, left_span[0] : left_span[1]]
+        right_roi = merged[:, right_span[0] : right_span[1]]
+        left_fill = cv2.countNonZero(left_roi) / max(left_roi.size, 1)
+        right_fill = cv2.countNonZero(right_roi) / max(right_roi.size, 1)
+        if right_fill >= left_fill * 1.35:
+            return None
+
+        row_density = np.count_nonzero(left_roi, axis=1) / max(left_width, 1)
+        active_rows = row_density > 0.02
+        top = next((index for index, active in enumerate(active_rows) if active), 0)
+        bottom = height - next((index for index, active in enumerate(reversed(active_rows)) if active), 0)
+        if bottom - top < height * 0.35:
+            return None
+
+        pad_x = max(8, int(left_width * 0.025))
+        pad_y = max(8, int((bottom - top) * 0.03))
+        left = max(0, left_span[0] - pad_x)
+        right = min(width, left_span[1] + pad_x)
+        top = max(0, top - pad_y)
+        bottom = min(height, bottom + pad_y)
+        return left, top, right - left, bottom - top
 
     def _extract_primary_label_area(self, label: Image.Image) -> Image.Image:
         if label.width < label.height * 1.1:

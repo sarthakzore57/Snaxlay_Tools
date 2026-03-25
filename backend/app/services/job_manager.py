@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
+from app.config import ORDERS_FILE
 from app.services.pdf_processor import PDFProcessor, ProcessResult
 
 
@@ -38,7 +41,7 @@ class JobManager:
     def __init__(self, processor: PDFProcessor | None = None) -> None:
         self.processor = processor or PDFProcessor()
         self._jobs: dict[str, JobRecord] = {}
-        self._orders: list[dict] = []
+        self._orders_file: Path = ORDERS_FILE
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=2)
 
@@ -75,14 +78,15 @@ class JobManager:
     def list_orders(self, selected_day: str = "today") -> dict[str, object]:
         today = datetime.now().date().isoformat()
         normalized_day = today if selected_day == "today" else selected_day
-        with self._lock:
-            all_orders = list(self._orders)
+        all_orders = self._load_orders()
 
-        available_days = sorted({order["order_day"] for order in all_orders}, reverse=True)
-        filtered_orders = [order for order in all_orders if order["order_day"] == normalized_day] if normalized_day else all_orders
+        available_days = sorted({self._dashboard_day(order) for order in all_orders if self._dashboard_day(order)}, reverse=True)
+        filtered_orders = [
+            order for order in all_orders if self._dashboard_day(order) == normalized_day
+        ] if normalized_day else all_orders
         filtered_orders.sort(
             key=lambda order: (
-                order.get("order_day", ""),
+                self._dashboard_day(order) or "",
                 order.get("order_date") or "",
                 order.get("source_file", ""),
                 order.get("source_page", 0),
@@ -97,7 +101,9 @@ class JobManager:
 
         buckets: dict[str, dict[str, float | int | str]] = {}
         for order in all_orders:
-            day = order["order_day"]
+            day = self._dashboard_day(order)
+            if not day:
+                continue
             bucket = buckets.setdefault(day, {"day": day, "order_count": 0, "revenue": 0.0})
             bucket["order_count"] += 1
             bucket["revenue"] = round(float(bucket["revenue"]) + float(order.get("price") or 0), 2)
@@ -122,6 +128,9 @@ class JobManager:
         if order_id:
             return f"order:{order_id}"
         return str(order.get("dedupe_key") or order.get("order_key"))
+
+    def _dashboard_day(self, order: dict) -> str | None:
+        return order.get("order_date") or order.get("invoice_date") or order.get("order_day")
 
     def _run_job(
         self,
@@ -185,14 +194,7 @@ class JobManager:
             deduped_orders_map[self._order_identity(normalized_order)] = normalized_order
         normalized_orders = list(deduped_orders_map.values())
 
-        with self._lock:
-            dedupe_keys = {self._order_identity(order) for order in normalized_orders}
-            self._orders = [
-                order
-                for order in self._orders
-                if order.get("job_id") != job_id and self._order_identity(order) not in dedupe_keys
-            ]
-            self._orders.extend(normalized_orders)
+        self._save_orders_for_job(job_id, normalized_orders)
         self._update_job(
             job_id,
             status="completed",
@@ -216,6 +218,56 @@ class JobManager:
             job = self._jobs[job_id]
             for key, value in changes.items():
                 setattr(job, key, value)
+
+    def _load_orders(self) -> list[dict]:
+        with self._lock:
+            if not self._orders_file.exists():
+                return []
+
+            orders: list[dict] = []
+            for raw_line in self._orders_file.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    orders.append(payload)
+            return orders
+
+    def _save_orders_for_job(self, job_id: str, orders: list[dict]) -> None:
+        with self._lock:
+            existing_orders = self._load_orders_unlocked()
+            dedupe_keys = {self._order_identity(order) for order in orders}
+            filtered_orders = [
+                order
+                for order in existing_orders
+                if order.get("job_id") != job_id and self._order_identity(order) not in dedupe_keys
+            ]
+            filtered_orders.extend(orders)
+            serialized = "\n".join(json.dumps(order, ensure_ascii=True) for order in filtered_orders)
+            if serialized:
+                serialized += "\n"
+            self._orders_file.write_text(serialized, encoding="utf-8")
+
+    def _load_orders_unlocked(self) -> list[dict]:
+        if not self._orders_file.exists():
+            return []
+
+        orders: list[dict] = []
+        for raw_line in self._orders_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                orders.append(payload)
+        return orders
 
     def _initial_estimate(self, pdf_size_bytes: int, detection_mode: str) -> float:
         size_mb = pdf_size_bytes / (1024 * 1024)

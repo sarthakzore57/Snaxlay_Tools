@@ -127,6 +127,72 @@ function formatDayLabel(value) {
   });
 }
 
+function normalizeCompactText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function extractNetQuantity(order) {
+  const source = `${order.product_name || ""} ${order.sku_code || ""}`;
+  const match = source.match(/(\d+(?:\.\d+)?)\s*(kg|g|gm|ml|l)\b/i);
+  if (!match) {
+    return "--";
+  }
+  const [, amount, unit] = match;
+  const normalizedUnit = unit.toUpperCase() === "GM" ? "G" : unit.toUpperCase();
+  return `${amount} ${normalizedUnit}`;
+}
+
+function deriveParentType(order) {
+  const haystack = normalizeCompactText(`${order.product_name || ""} ${order.sku_code || ""}`);
+  const rules = [
+    { label: "Raisins", patterns: ["raisin", "raisien", "kishmish"] },
+    { label: "Dates", patterns: ["date", "khajoor", "khajur"] },
+    { label: "Cashews", patterns: ["cashew", "kaju"] },
+    { label: "Almonds", patterns: ["almond", "badam"] },
+    { label: "Black Pepper", patterns: ["black pepper", "pepper", "pappar", "cblack"] },
+    { label: "Panchmeva", patterns: ["panchmeva"] },
+    { label: "Combo", patterns: ["combo", "mix"] },
+  ];
+  const match = rules.find(({ patterns }) => patterns.some((pattern) => haystack.includes(pattern)));
+  return match?.label || "Other";
+}
+
+function normalizeUnitCount(order) {
+  const quantity = Number(order.quantity);
+  if (Number.isInteger(quantity) && quantity > 0 && quantity <= 500) {
+    return quantity;
+  }
+  return 1;
+}
+
+function buildAdminRow(order) {
+  return {
+    id: order.order_key,
+    vendorName: order.vendor || "--",
+    productName: order.product_name && order.product_name !== "Qty" ? order.product_name : order.sku_code || "--",
+    totalUnit: normalizeUnitCount(order),
+    orderId: order.order_id || order.suborder_id || order.awb_number || "--",
+    skuId: order.sku_code || order.suborder_id || order.order_id || "--",
+    date: order.order_date || order.invoice_date || order.order_day,
+    netQuantity: extractNetQuantity(order),
+    parentType: deriveParentType(order),
+  };
+}
+
+function formatExportDate(value) {
+  if (!value) {
+    return "--";
+  }
+  const parsed = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toLocaleDateString("en-IN");
+}
+
 function App() {
   const [activeWorkspace, setActiveWorkspace] = useState("print");
   const [files, setFiles] = useState([]);
@@ -144,6 +210,9 @@ function App() {
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [ordersError, setOrdersError] = useState("");
   const [selectedOrdersDay, setSelectedOrdersDay] = useState("today");
+  const [vendorFilter, setVendorFilter] = useState("all");
+  const [parentTypeFilter, setParentTypeFilter] = useState("all");
+  const [searchQuery, setSearchQuery] = useState("");
   const pollRef = useRef(null);
 
   const estimatedTime = estimateProcessingTime(files, detectionMode, layout);
@@ -154,6 +223,37 @@ function App() {
     }
     return Math.max(uploadProgress, job.progress_percent ?? 0);
   }, [job, uploadProgress]);
+  const adminRows = useMemo(() => ordersData.orders.map(buildAdminRow), [ordersData.orders]);
+  const vendorOptions = useMemo(
+    () => [...new Set(adminRows.map((row) => row.vendorName).filter((value) => value && value !== "--"))].sort(),
+    [adminRows],
+  );
+  const parentTypeOptions = useMemo(
+    () => [...new Set(adminRows.map((row) => row.parentType).filter(Boolean))].sort(),
+    [adminRows],
+  );
+  const filteredAdminRows = useMemo(() => {
+    const query = normalizeCompactText(searchQuery);
+    return adminRows.filter((row) => {
+      if (vendorFilter !== "all" && row.vendorName !== vendorFilter) {
+        return false;
+      }
+      if (parentTypeFilter !== "all" && row.parentType !== parentTypeFilter) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      const haystack = normalizeCompactText(
+        [row.vendorName, row.productName, row.orderId, row.skuId, row.date, row.netQuantity, row.parentType].join(" "),
+      );
+      return haystack.includes(query);
+    });
+  }, [adminRows, parentTypeFilter, searchQuery, vendorFilter]);
+  const filteredUnitTotal = useMemo(
+    () => filteredAdminRows.reduce((sum, row) => sum + row.totalUnit, 0),
+    [filteredAdminRows],
+  );
 
   useEffect(() => {
     return () => {
@@ -165,6 +265,12 @@ function App() {
 
   useEffect(() => {
     fetchOrders(selectedOrdersDay);
+  }, [selectedOrdersDay]);
+
+  useEffect(() => {
+    setVendorFilter("all");
+    setParentTypeFilter("all");
+    setSearchQuery("");
   }, [selectedOrdersDay]);
 
   const pushLog = (message) => {
@@ -320,6 +426,35 @@ function App() {
       setError(getErrorMessage(requestError, fallbackMessage));
       setIsSubmitting(false);
     }
+  };
+
+  const exportOrdersToExcel = () => {
+    if (!filteredAdminRows.length || typeof window === "undefined") {
+      return;
+    }
+
+    const headers = ["Vendor Name", "Product Name", "Total Unit", "Order ID", "SKU ID", "Date", "Net Quantity", "Parent Type"];
+    const rows = filteredAdminRows.map((row) => [
+      row.vendorName,
+      row.productName,
+      row.totalUnit,
+      row.orderId,
+      row.skuId,
+      formatExportDate(row.date),
+      row.netQuantity,
+      row.parentType,
+    ]);
+    const csv = [headers, ...rows]
+      .map((line) => line.map((value) => `"${String(value ?? "").replace(/"/g, "\"\"")}"`).join(","))
+      .join("\n");
+
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `admin-orders-${ordersData.selected_day === "today" ? "today" : ordersData.selected_day}.csv`;
+    link.click();
+    window.URL.revokeObjectURL(url);
   };
 
   const completedStageIndex = job ? Math.max(stageOrder.indexOf(job.stage), 0) : -1;
@@ -620,8 +755,8 @@ function App() {
           <section className="panel orders-summary-panel">
             <div className="panel-header">
               <div>
-                <h2>Orders Dashboard</h2>
-                <p className="panel-subtitle">Track day-wise order volume, value, and label-ready inventory from uploaded PDFs.</p>
+                <h2>Admin Panel</h2>
+                <p className="panel-subtitle">Inventory-style order view with order ID, SKU, units, net quantity, and export.</p>
               </div>
               <button type="button" className="primary-button compact" onClick={() => fetchOrders(selectedOrdersDay)}>
                 Refresh Data
@@ -656,24 +791,24 @@ function App() {
                 <strong>{formatDayLabel(ordersData.selected_day)}</strong>
               </div>
               <div className="summary-card">
-                <span>Total Orders</span>
-                <strong>{ordersData.summary.total_orders}</strong>
+                <span>Visible Rows</span>
+                <strong>{filteredAdminRows.length}</strong>
               </div>
               <div className="summary-card">
-                <span>Total Quantity</span>
-                <strong>{ordersData.summary.total_quantity}</strong>
+                <span>Total Units</span>
+                <strong>{filteredUnitTotal}</strong>
               </div>
               <div className="summary-card">
-                <span>Total Revenue</span>
-                <strong>{formatCurrency(ordersData.summary.total_revenue)}</strong>
+                <span>Vendors</span>
+                <strong>{vendorOptions.length}</strong>
               </div>
               <div className="summary-card">
-                <span>COD Orders</span>
-                <strong>{ordersData.summary.cod_orders}</strong>
+                <span>Parent Types</span>
+                <strong>{parentTypeOptions.length}</strong>
               </div>
               <div className="summary-card">
-                <span>Prepaid Orders</span>
-                <strong>{ordersData.summary.prepaid_orders}</strong>
+                <span>All Records</span>
+                <strong>{ordersData.orders.length}</strong>
               </div>
             </div>
 
@@ -703,10 +838,10 @@ function App() {
           <section className="panel orders-table-panel">
             <div className="panel-header">
               <div>
-                <h2>Order Lines</h2>
-                <p className="panel-subtitle">Structured fields extracted directly from your shipping invoices and labels.</p>
+                <h2>Admin Order Table</h2>
+                <p className="panel-subtitle">Showing vendor, product, units, order ID, SKU, date, net quantity, and parent type.</p>
               </div>
-              <span className="status-pill">{ordersLoading ? "Loading" : `${ordersData.orders.length} records`}</span>
+              <span className="status-pill">{ordersLoading ? "Loading" : `${filteredAdminRows.length} records`}</span>
             </div>
 
             {ordersLoading ? (
@@ -714,44 +849,77 @@ function App() {
                 <p>Refreshing dashboard data.</p>
                 <span>The latest extracted orders are being loaded.</span>
               </div>
-            ) : ordersData.orders.length ? (
+            ) : adminRows.length ? (
               <>
+                <div className="table-toolbar">
+                  <input
+                    type="text"
+                    className="table-filter-input"
+                    placeholder="Search vendor, product, order ID, SKU, type"
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                  />
+                  <select className="table-filter-select" value={vendorFilter} onChange={(event) => setVendorFilter(event.target.value)}>
+                    <option value="all">All vendors</option>
+                    {vendorOptions.map((value) => (
+                      <option key={value} value={value}>
+                        {value}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="table-filter-select"
+                    value={parentTypeFilter}
+                    onChange={(event) => setParentTypeFilter(event.target.value)}
+                  >
+                    <option value="all">All parent types</option>
+                    {parentTypeOptions.map((value) => (
+                      <option key={value} value={value}>
+                        {value}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="chip table-reset-button"
+                    onClick={() => {
+                      setSearchQuery("");
+                      setVendorFilter("all");
+                      setParentTypeFilter("all");
+                    }}
+                  >
+                    Reset Filters
+                  </button>
+                  <button type="button" className="primary-button compact table-export-button" onClick={exportOrdersToExcel}>
+                    Export to Excel
+                  </button>
+                </div>
+
                 <div className="orders-table-wrapper">
                   <table className="orders-table">
                     <thead>
                       <tr>
-                        <th>Date</th>
-                        <th>Vendor</th>
-                        <th>Customer</th>
-                        <th>Product</th>
-                        <th>Qty</th>
-                        <th>Price</th>
-                        <th>Delivery</th>
+                        <th>Vendor Name</th>
+                        <th>Product Name</th>
+                        <th>Total Unit</th>
                         <th>Order ID</th>
-                        <th>Source</th>
+                        <th>SKU ID</th>
+                        <th>Date</th>
+                        <th>Net Quantity</th>
+                        <th>Parent Type</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {ordersData.orders.map((order) => (
-                        <tr key={order.order_key}>
-                          <td>{formatDayLabel(order.order_day)}</td>
-                          <td>{order.vendor}</td>
-                          <td>
-                            <strong>{order.customer_name || "--"}</strong>
-                            <span>{[order.city, order.state].filter(Boolean).join(", ") || order.platform || "--"}</span>
-                          </td>
-                          <td>
-                            <strong>{order.product_name || "--"}</strong>
-                            <span>{order.sku_code || order.suborder_id || "--"}</span>
-                          </td>
-                          <td>{order.quantity ?? "--"}</td>
-                          <td>{formatCurrency(order.price)}</td>
-                          <td>{order.delivery_option || "--"}</td>
-                          <td>{order.order_id || order.invoice_number || "--"}</td>
-                          <td>
-                            <strong>{order.source_file}</strong>
-                            <span>Page {order.source_page}</span>
-                          </td>
+                      {filteredAdminRows.map((row) => (
+                        <tr key={row.id}>
+                          <td>{row.vendorName}</td>
+                          <td>{row.productName}</td>
+                          <td>{row.totalUnit}</td>
+                          <td>{row.orderId}</td>
+                          <td>{row.skuId}</td>
+                          <td>{formatDayLabel(row.date)}</td>
+                          <td>{row.netQuantity}</td>
+                          <td>{row.parentType}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -759,22 +927,23 @@ function App() {
                 </div>
 
                 <div className="orders-cards">
-                  {ordersData.orders.map((order) => (
-                    <article key={order.order_key} className="order-card">
+                  {filteredAdminRows.map((row) => (
+                    <article key={row.id} className="order-card">
                       <div className="order-card-top">
-                        <span className="order-card-tag">{order.vendor}</span>
-                        <span className="order-card-day">{formatDayLabel(order.order_day)}</span>
+                        <span className="order-card-tag">{row.vendorName}</span>
+                        <span className="order-card-day">{formatDayLabel(row.date)}</span>
                       </div>
-                      <h3>{order.product_name || "Unlabeled product"}</h3>
-                      <p>{order.customer_name || "Unknown customer"}</p>
+                      <h3>{row.productName}</h3>
+                      <p>{row.parentType}</p>
                       <div className="order-card-meta">
-                        <span>Qty {order.quantity ?? "--"}</span>
-                        <span>{formatCurrency(order.price)}</span>
-                        <span>{order.delivery_option || "--"}</span>
+                        <span>Units {row.totalUnit}</span>
+                        <span>{row.netQuantity}</span>
+                        <span>{row.orderId}</span>
+                        <span>{row.skuId}</span>
                       </div>
                       <div className="order-card-foot">
-                        <span>{order.order_id || order.invoice_number || "--"}</span>
-                        <span>{order.source_file} • Page {order.source_page}</span>
+                        <span>{row.vendorName}</span>
+                        <span>{formatDayLabel(row.date)}</span>
                       </div>
                     </article>
                   ))}
@@ -782,8 +951,8 @@ function App() {
               </>
             ) : (
               <div className="empty-preview">
-                <p>No orders available for {formatDayLabel(ordersData.selected_day)}.</p>
-                <span>Switch the day filter or process more PDFs to build the dashboard.</span>
+                <p>No admin rows available for {formatDayLabel(ordersData.selected_day)}.</p>
+                <span>Switch the day filter or process more PDFs to populate this panel.</span>
               </div>
             )}
           </section>
